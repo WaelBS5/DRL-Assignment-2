@@ -195,14 +195,15 @@ class Game2048Env(gym.Env):
             raise ValueError("Invalid action")
         return not np.array_equal(self.board, temp_board)
 
-# Heuristic function to evaluate board states
-def evaluate_board(board):
+# Enhanced heuristic function to evaluate board states
+def evaluate_board(board, score):
     """
-    Evaluate the board state using heuristics:
-    - Corner strategy: Reward high tiles in bottom-right (3,3)
-    - Monotonicity: Encourage increasing/decreasing tiles along rows/columns
-    - Empty tiles: Reward more empty tiles
+    Evaluate the board state using improved heuristics:
+    - Corner strategy: Strongly reward high tiles in bottom-right (3,3)
+    - Monotonicity: Encourage increasing tiles towards bottom-right
+    - Empty tiles: Reward more empty tiles for flexibility
     - Smoothness: Minimize differences between adjacent tiles
+    - Merging potential: Reward setups for future merges
     """
     # Convert tiles to log2 values for smoother differences
     log_board = np.zeros_like(board, dtype=float)
@@ -210,48 +211,61 @@ def evaluate_board(board):
         for j in range(4):
             log_board[i, j] = 0 if board[i, j] == 0 else math.log2(board[i, j])
 
-    # Corner strategy: Reward high tiles in (3,3)
-    corner_score = log_board[3, 3] * 1000  # High weight for bottom-right
+    # Corner strategy: Strongly reward high tiles in (3,3)
+    corner_score = log_board[3, 3] * 5000  # Increased weight to push tiles to bottom-right
+    # Reward gradient towards (3,3)
+    gradient_score = 0
+    for i in range(4):
+        for j in range(4):
+            if board[i, j] != 0:
+                # Distance from (3,3) penalizes tiles far away
+                distance = abs(3 - i) + abs(3 - j)
+                gradient_score += log_board[i, j] * (10 - distance) * 100
 
     # Monotonicity: Prefer increasing tiles towards bottom-right
     mono_score = 0
-    # Rows: Prefer increasing rightward or leftward
+    # Rows: Prefer increasing rightward
     for i in range(4):
         row = log_board[i]
-        # Increasing rightward
-        diffs_right = sum(row[j+1] - row[j] for j in range(3) if row[j] != 0 and row[j+1] != 0)
-        # Increasing leftward
-        diffs_left = sum(row[j] - row[j+1] for j in range(3) if row[j] != 0 and row[j+1] != 0)
-        mono_score += max(diffs_right, diffs_left) * 100  # Reward the better direction
-    # Columns: Prefer increasing downward or upward
+        diffs_right = sum(max(0, row[j+1] - row[j]) for j in range(3) if row[j] != 0 and row[j+1] != 0)
+        mono_score += diffs_right * 200  # Increased weight
+    # Columns: Prefer increasing downward
     for j in range(4):
         col = log_board[:, j]
-        # Increasing downward
-        diffs_down = sum(col[i+1] - col[i] for i in range(3) if col[i] != 0 and col[i+1] != 0)
-        # Increasing upward
-        diffs_up = sum(col[i] - col[i+1] for i in range(3) if col[i] != 0 and col[i+1] != 0)
-        mono_score += max(diffs_down, diffs_up) * 100
+        diffs_down = sum(max(0, col[i+1] - col[i]) for i in range(3) if col[i] != 0 and col[i+1] != 0)
+        mono_score += diffs_down * 200
 
     # Empty tiles: More empty tiles = more flexibility
     empty_tiles = np.count_nonzero(board == 0)
-    empty_score = empty_tiles * 500  # High weight to keep board open
+    empty_score = empty_tiles * 1000  # Increased weight to prioritize flexibility
 
     # Smoothness: Minimize differences between adjacent tiles
     smoothness_score = 0
     for i in range(4):
         for j in range(3):
             if board[i, j] != 0 and board[i, j+1] != 0:
-                smoothness_score -= abs(log_board[i, j] - log_board[i, j+1]) * 50
+                smoothness_score -= abs(log_board[i, j] - log_board[i, j+1]) * 100
     for j in range(4):
         for i in range(3):
             if board[i, j] != 0 and board[i+1, j] != 0:
-                smoothness_score -= abs(log_board[i, j] - log_board[i+1, j]) * 50
+                smoothness_score -= abs(log_board[i, j] - log_board[i+1, j]) * 100
+
+    # Merging potential: Reward adjacent equal tiles
+    merge_score = 0
+    for i in range(4):
+        for j in range(3):
+            if board[i, j] != 0 and board[i, j] == board[i, j+1]:
+                merge_score += log_board[i, j] * 500
+    for j in range(4):
+        for i in range(3):
+            if board[i, j] != 0 and board[i, j] == board[i+1, j]:
+                merge_score += log_board[i, j] * 500
 
     # Combine scores
-    total_score = corner_score + mono_score + empty_score + smoothness_score
+    total_score = corner_score + gradient_score + mono_score + empty_score + smoothness_score + merge_score + score
     return total_score
 
-# Simple MCTS class using the heuristic for rollouts
+# Enhanced MCTS class using the improved heuristic
 class MCTS:
     class Node:
         def __init__(self, env, state, score, parent=None, action=None):
@@ -265,7 +279,11 @@ class MCTS:
             self.children = {}
             self.visits = 0
             self.total_value = 0.0
-            self.untried_actions = [a for a in range(4) if self.env.is_move_legal(a)]
+            # Prioritize moves towards bottom-right: down (1), right (3), left (2), up (0)
+            self.untried_actions = sorted(
+                [a for a in range(4) if self.env.is_move_legal(a)],
+                key=lambda x: {1: 0, 3: 1, 2: 2, 0: 3}.get(x, 4)
+            )
 
         def fully_expanded(self):
             return len(self.untried_actions) == 0
@@ -277,7 +295,7 @@ class MCTS:
             exploration = exploration_weight * math.sqrt(math.log(self.parent.visits) / self.visits)
             return exploitation + exploration
 
-    def __init__(self, env, iterations=50, rollout_depth=5):
+    def __init__(self, env, iterations=200, rollout_depth=10):
         self.env = env
         self.iterations = iterations
         self.rollout_depth = rollout_depth
@@ -296,12 +314,15 @@ class MCTS:
         for _ in range(depth):
             if rollout_env.is_game_over():
                 break
-            legal_moves = [a for a in range(4) if rollout_env.is_move_legal(a)]
+            legal_moves = sorted(
+                [a for a in range(4) if rollout_env.is_move_legal(a)],
+                key=lambda x: {1: 0, 3: 1, 2: 2, 0: 3}.get(x, 4)
+            )
             if not legal_moves:
                 break
-            action = random.choice(legal_moves)
+            action = random.choice(legal_moves[:2] if len(legal_moves) >= 2 else legal_moves)  # Prefer down/right
             rollout_env.step(action)
-        return evaluate_board(rollout_env.board) + rollout_env.score
+        return evaluate_board(rollout_env.board, rollout_env.score)
 
     def backpropagate(self, node, value):
         current = node
@@ -318,8 +339,7 @@ class MCTS:
             sim_env.board = node.state.copy()
             sim_env.score = node.score
         if not node.fully_expanded() and not sim_env.is_game_over():
-            action = random.choice(node.untried_actions)
-            node.untried_actions.remove(action)
+            action = node.untried_actions.pop(0)  # Take the first (prioritized) action
             new_state, new_score, done, _ = sim_env.step(action)
             child = self.Node(sim_env, new_state.copy(), new_score, parent=node, action=action)
             node.children[action] = child
@@ -336,7 +356,7 @@ class MCTS:
 
 # Initialize environment and MCTS
 env = Game2048Env()
-mcts = MCTS(env, iterations=50, rollout_depth=5)
+mcts = MCTS(env, iterations=200, rollout_depth=10)
 
 def get_action(state, score):
     # Set up the environment with the given state and score
@@ -349,9 +369,12 @@ def get_action(state, score):
     # Run MCTS to find the best action
     best_action = mcts.best_action(root)
 
-    # Fallback to heuristic if MCTS fails
+    # Enhanced fallback: Prioritize immediate merges and heuristics
     if best_action is None:
-        legal_moves = [a for a in range(4) if env.is_move_legal(a)]
+        legal_moves = sorted(
+            [a for a in range(4) if env.is_move_legal(a)],
+            key=lambda x: {1: 0, 3: 1, 2: 2, 0: 3}.get(x, 4)
+        )
         if not legal_moves:
             return random.choice([0, 1, 2, 3])  # Fallback if no legal moves
         best_value = -float('inf')
@@ -359,7 +382,9 @@ def get_action(state, score):
         temp_env = copy.deepcopy(env)
         for action in legal_moves:
             new_state, new_score, _, _ = temp_env.step(action)
-            value = evaluate_board(new_state) + new_score
+            merge_bonus = new_score * 2  # Double weight on immediate merges
+            heuristic_value = evaluate_board(new_state, new_score)
+            value = merge_bonus + heuristic_value
             if value > best_value:
                 best_value = value
                 best_action = action
